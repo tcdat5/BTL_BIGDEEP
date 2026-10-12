@@ -1,0 +1,51 @@
+# Copy thành config.yaml rồi sửa theo cụm thật. config.yaml KHÔNG commit.
+cluster:
+  spark_master: spark://master:7077
+  spark_master_ui: http://master:8080
+  expected_workers: 2
+  expected_datanodes: 2
+  kafka_bootstrap: master:9092
+  kafka_home: /opt/kafka
+  # Spark trên cụm build Scala 2.13 -> _2.13 (pip pyspark local là Scala 2.12 -> _2.12)
+  kafka_package: org.apache.spark:spark-sql-kafka-0-10_2.13:3.5.1
+spark:
+  driver_memory: 1g
+  executor_memory: 1g
+  executor_cores: 1
+  total_executor_cores: 2
+  shuffle_partitions: 12
+hdfs:
+  raw_dir: hdfs:///user/hadoop/cicids2018/raw
+  processed_dir: hdfs:///user/hadoop/cicids2018/processed
+  sample_dir: hdfs:///user/hadoop/cicids2018/kaggle_sample
+data:
+  raw_files:
+    - Wednesday-14-02-2018_TrafficForML_CICFlowMeter.csv
+    - Friday-16-02-2018_TrafficForML_CICFlowMeter.csv
+    - Wednesday-21-02-2018_TrafficForML_CICFlowMeter.csv
+    - Friday-02-03-2018_TrafficForML_CICFlowMeter.csv
+  local_dir: data/processed
+  sample_local_dir: data/kaggle_sample
+  test_cap: 300000
+  sample_sizes:
+    train: 500000
+    val: 200000
+    test: 300000
+models:
+  scaler: models/scaler.json
+  stream_model: models/ae.onnx
+  stream_threshold: models/threshold.json
+kafka:
+  topic: network-flows
+  partitions: 3
+streaming:
+  output_dir: results/stream/default
+  checkpoint_dir: checkpoints/stream_default
+  batches_csv: results/stream_batches.csv
+  trigger_s: 2
+  max_offsets_per_trigger: 20000
+  starting_offsets: latest
+  inference: executor
+dashboard:
+  refresh_s: 3
+  max_files: 2000

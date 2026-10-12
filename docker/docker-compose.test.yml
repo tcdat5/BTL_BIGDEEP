@@ -1,0 +1,35 @@
+# Tên project riêng để không đụng container của project compose khác cùng tên thư mục "docker".
+name: btl-bigdeep-test
+services:
+  kafka:
+    image: apache/kafka:3.7.2
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+  cluster:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cluster-test
+    volumes:
+      - ..:/repo
+      - ivy-cache:/root/.ivy2
+    environment:
+      BTL_CONFIG: /repo/tests/config.test.yaml
+      KAFKA_BOOTSTRAP: kafka:9092
+      # spark.jars.packages chỉ có tác dụng khi JVM khởi động -> nạp connector ngay từ đầu cho mọi test Spark
+      PYSPARK_SUBMIT_ARGS: --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 pyspark-shell
+    depends_on:
+      - kafka
+    working_dir: /repo
+volumes:
+  ivy-cache: {}

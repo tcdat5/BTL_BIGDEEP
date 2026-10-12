@@ -1,0 +1,9 @@
+# Mô phỏng VM: Python 3.8 + Java 8 + requirements-cluster.txt
+# JRE chép từ image Temurin (mirror apt của Debian bullseye đã bị archive, không cài được openjdk qua apt).
+FROM python:3.8-slim-bullseye
+COPY --from=eclipse-temurin:8-jre /opt/java/openjdk /opt/java/openjdk
+ENV JAVA_HOME=/opt/java/openjdk
+ENV PATH="/opt/java/openjdk/bin:${PATH}"
+COPY requirements-cluster.txt /tmp/requirements-cluster.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-cluster.txt pytest==8.3.5 onnx==1.16.2
+WORKDIR /repo
