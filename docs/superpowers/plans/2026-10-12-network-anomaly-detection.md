@@ -37,8 +37,9 @@
 |---|---|---|
 | M0 | Thứ 2 tối | 1, 2, 3, 4 (+ Phụ lục A bước A1–A4 do người dùng làm trên cụm song song) |
 | M1 | Thứ 3 trưa | 5 (+ A5: chạy preprocess trên cụm, upload mẫu lên Kaggle) |
+| M1b | Thứ 3 chiều | 5b (chạy trên Kaggle CPU song song lúc GPU train) |
 | M2a | Thứ 3 chiều | 6, 7, 8, 9 (+ chạy trên Kaggle) |
-| M2b | Thứ 3 tối | 10, 11 |
+| M2b | Thứ 3 tối | 10, 11, 11b |
 | M3 | Thứ 4 chiều | 12, 13, 14 (+ A6: chạy end-to-end trên cụm) |
 | M4 | Thứ 4 tối | 15 |
 | M5 | Thứ 5 sáng | 16 (+ A7: chạy benchmark trên cụm) |
@@ -59,6 +60,7 @@
 | `train/run_ablation.py` | lưới ablation AE (+VAE β) | Kaggle |
 | `train/kaggle_run_all.sh`, `train/kaggle_notebook.ipynb` | chạy toàn bộ phần train trên Kaggle | Kaggle |
 | `analysis/make_report_assets.py` | bảng + hình → `reports/` | Kaggle/laptop |
+| `analysis/eda.py` | trực quan hoá dữ liệu (phần 1) + latent space (phần 2 `--latent`) → `reports/eda/` | Kaggle CPU/laptop |
 | `streaming/producer.py` | replay Parquet test → Kafka | cụm (master) |
 | `streaming/scorer.py` | `OnnxScorer`, `get_scorer` (cache/process), `score_frame` | cụm |
 | `streaming/output_io.py` | `OUTPUT_COLUMNS`, `load_output` | cụm |
@@ -110,6 +112,8 @@ def build_model(kind, d, hidden=(64,32), latent=16, noise_std=0.1) -> nn.Module
 def score_module(kind, model) -> nn.Module   # forward(x) -> score [batch]
 def vae_loss(x, recon, mu, logvar, beta) -> (loss, recon_loss, kl)
 def count_params(model) -> int
+def encode_latent(model, x) -> Tensor          # AE/DAE: encoder(x); VAE: μ
+def save_checkpoint(path, kind, model, d, hidden, latent, noise_std); def load_checkpoint(path) -> (kind, model)
 
 # train/train_dl.py
 def parse_args(argv=None) -> argparse.Namespace
@@ -130,7 +134,7 @@ def load_output(out_dir, max_files=None) -> pd.DataFrame
 def summarize(df) -> dict
 ```
 
-File output (khớp spec 5.2/5.3): `results/baselines_metrics.csv`, `results/baselines_per_attack.csv`, `results/dl_<kind>_metrics.csv` (= `METRIC_COLUMNS + ["n_params"]`), `results/dl_<kind>_per_attack.csv`, `results/dl_<kind>_history.csv`, `results/scores_<Name>.npz` (`y`, `score`, `thr`), `results/valscores_<Name>.npy` (score val Benign, cho ablation ngưỡng), `models/<kind>.onnx`, `models/threshold_<kind>.json`, `models/ae.onnx`, `models/threshold.json`, `<results_dir>/holdout.json` (`{"attack": ...}`).
+File output (khớp spec 5.2/5.3): `results/baselines_metrics.csv`, `results/baselines_per_attack.csv`, `results/dl_<kind>_metrics.csv` (= `METRIC_COLUMNS + ["n_params"]`), `results/dl_<kind>_per_attack.csv`, `results/dl_<kind>_history.csv`, `results/scores_<Name>.npz` (`y`, `score`, `thr`), `results/valscores_<Name>.npy` (score val Benign, cho ablation ngưỡng), `models/<kind>.onnx`, `models/<kind>.pt` (state_dict + kiến trúc, cho EDA latent), `models/threshold_<kind>.json`, `models/ae.onnx`, `models/threshold.json`, `<results_dir>/holdout.json` (`{"attack": ...}`).
 
 ---
 
@@ -171,7 +175,7 @@ hdfs dfs -put Wednesday-14-02-2018_TrafficForML_CICFlowMeter.csv Friday-16-02-20
 
 **A4. Tạo `config.yaml`** từ `config.example.yaml`, sửa hostname/port/đường dẫn HDFS/RAM theo cụm thật; chạy `bash scripts/check_cluster.sh` → cả 3 dòng `[PASS]`.
 
-**A5. (sau Task 5)** `bash scripts/run_preprocess.sh` → upload thư mục `data/kaggle_sample/` (train/, val/, test/, scaler.json) thành Kaggle Dataset tên `btl-cicids2018-sample`; copy `models/scaler.json` và `results/preprocess_stats.json` về repo.
+**A5. (sau Task 5)** `bash scripts/run_preprocess.sh` → upload thư mục `data/kaggle_sample/` (train/, val/, test/, scaler.json, preprocess_stats.json) thành Kaggle Dataset tên `btl-cicids2018-sample`; copy `models/scaler.json` và `results/preprocess_stats.json` về repo.
 
 **A6. (sau Task 14)** Copy `models/ae.onnx`, `models/threshold.json` từ output Kaggle vào `models/` trên master; `hdfs dfs -get <processed_dir>/test data/processed/test`; chạy theo README mục "Streaming".
 
@@ -220,6 +224,7 @@ metastore_db/
 derby.log
 .ipynb_checkpoints/
 models/*.onnx
+models/*.pt
 results/**/*.npz
 results/**/*.npy
 results/stream/
@@ -1328,7 +1333,19 @@ def test_sample_and_stats(run_pre):
     assert stats["constant_cols_dropped"] == ["Const Col"]
     assert set(stats["label_distribution"]) == {"train", "val", "test"}
     assert "read_clean" in stats["timings_s"]
+
+
+def test_cleaning_steps_for_eda(run_pre):
+    _, stats = run_pre
+    steps = {s["step"]: s for s in stats["cleaning"]}
+    assert list(steps) == ["read_csv", "drop_repeated_headers", "drop_nan_inf", "drop_constant_cols", "drop_duplicates"]
+    assert steps["drop_repeated_headers"]["rows_removed"] == 3          # 1 header lặp mỗi file
+    assert steps["drop_nan_inf"]["rows_removed"] == 3 * 2               # 2 dòng bẩn mỗi file
+    assert steps["drop_duplicates"]["rows_removed"] == 3 * 10           # 10 dòng trùng mỗi file
+    assert steps["drop_constant_cols"]["cols"] == steps["drop_nan_inf"]["cols"] - 1
 ```
+
+Ghi chú test trùng lặp: 10 dòng trùng là bản sao của dòng 0–9, không trùng với dòng bẩn 50–51, nên `drop_nan_inf` không làm mất chúng.
 
 - [ ] **Step 2: Chạy test, xác nhận fail**
 
@@ -1437,7 +1454,11 @@ def read_raw(spark, paths):
         extra = sorted(set(f.columns) - common)
         if extra:
             print("[warn] %s: bỏ cột không có ở mọi file: %s" % (p, extra))
-    df = reduce(lambda x, y: x.unionByName(y), [f.select(*cols) for f in frames])
+    return reduce(lambda x, y: x.unionByName(y), [f.select(*cols) for f in frames])
+
+
+def drop_repeated_headers(df):
+    from pyspark.sql import functions as F
     return df.filter(F.col(LABEL_COL) != LABEL_COL)
 
 
@@ -1489,8 +1510,11 @@ def main(argv=None) -> dict:
     paths = ["%s/%s" % (a.input_dir.rstrip("/"), f) for f in a.files]
 
     with timed(stats, "read_clean"):
-        raw = read_raw(spark, paths)
+        lines = read_raw(spark, paths)
+        stats["rows"]["raw_lines"] = lines.count()          # gồm cả các dòng header lặp
+        raw = drop_repeated_headers(lines)
         stats["rows"]["raw"] = raw.count()
+        n_cols_raw = len(raw.columns)
         clean, feats = cast_and_clean(raw)
         clean = clean.persist(StorageLevel.MEMORY_AND_DISK)
         stats["rows"]["after_clean"] = clean.count()
@@ -1505,6 +1529,16 @@ def main(argv=None) -> dict:
             .persist(StorageLevel.MEMORY_AND_DISK)
         stats["rows"]["after_dedup"] = dedup.count()
         clean.unpersist()
+    r = stats["rows"]
+    # Bảng "hiệu quả làm sạch" cho analysis/eda.py (PROJECT_SPEC 5.10 mục 2)
+    stats["cleaning"] = [
+        {"step": "read_csv", "rows": r["raw_lines"], "rows_removed": 0, "cols": n_cols_raw},
+        {"step": "drop_repeated_headers", "rows": r["raw"], "rows_removed": r["raw_lines"] - r["raw"], "cols": n_cols_raw},
+        {"step": "drop_nan_inf", "rows": r["after_clean"], "rows_removed": r["raw"] - r["after_clean"], "cols": n_cols_raw},
+        {"step": "drop_constant_cols", "rows": r["after_clean"], "rows_removed": 0, "cols": n_cols_raw - len(const)},
+        {"step": "drop_duplicates", "rows": r["after_dedup"], "rows_removed": r["after_clean"] - r["after_dedup"],
+         "cols": n_cols_raw - len(const)},
+    ]
 
     cols = [ID_COL, TS_COL] + feats + [LABEL_COL]
     split_dfs = {}
@@ -1546,7 +1580,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Chạy test, xác nhận pass**
 
 Run: `docker compose -f docker/docker-compose.test.yml run --rm --no-deps cluster pytest tests/test_preprocess.py -q`
-Expected: `5 passed` (~1–2 phút).
+Expected: `6 passed` (~1–2 phút).
 
 - [ ] **Step 5: `scripts/run_preprocess.sh`**
 
@@ -1571,6 +1605,7 @@ spark-submit --master "$(cfg cluster.spark_master)" \
 rm -rf "$SAMPLE_LOCAL" && mkdir -p "$SAMPLE_LOCAL"
 for s in train val test; do hdfs dfs -get "$SAMPLE_HDFS/$s" "$SAMPLE_LOCAL/$s"; done
 cp "$(cfg models.scaler)" "$SAMPLE_LOCAL/scaler.json"
+cp results/preprocess_stats.json "$SAMPLE_LOCAL/preprocess_stats.json"   # cho analysis/eda.py trên Kaggle
 echo "Bản mẫu Kaggle: $SAMPLE_LOCAL  (upload thư mục này thành Kaggle Dataset)"
 ```
 
@@ -1593,6 +1628,491 @@ git commit -m "feat(preprocess): Spark CSV->Parquet split, scaler, Kaggle sample
 ```
 
 Báo người dùng chạy Phụ lục A5.
+
+---
+
+### Task 5b: `analysis/eda.py` phần 1 — trực quan hoá dữ liệu (M1b)
+
+**REQUIRED:** load skill `dataviz` trước khi viết code vẽ.
+
+**Files:**
+- Create: `analysis/__init__.py` (rỗng), `analysis/eda.py`
+- Modify: `requirements-kaggle.txt` (thêm dòng `scipy>=1.10`), `README.md`
+- Test: `tests/test_eda.py`
+
+**Interfaces:**
+- Consumes: `common.data` (`BENIGN`, `CLIP`, `LABEL_COL`, `SEED`, `binarize`, `frame_to_matrix`, `load_scaler`, `read_split_frame`), `common.config`, `common.fake.write_fake_dataset`; `results/preprocess_stats.json` với khoá `label_distribution` (split → {label: count}) và `cleaning` (list `{step, rows, rows_removed, cols}`) do Task 5 ghi.
+- Produces: CLI `python analysis/eda.py [--data-dir --scaler --stats --out reports/eda --per-class 2000 --top-k 12 --max-rows 200000 --perplexity 30 --skip-tsne --latent --no-part1 --models-dir models --smoke]`; hàm `stratified_sample(df, per_class, seed=SEED) -> DataFrame`, `main(argv=None) -> dict` (thời gian từng bước). File trong `--out`: `label_distribution.png`, `label_counts.csv`, `cleaning_steps.csv`, `ks_table.csv`, `top_features_box.png`, `correlation_heatmap.png`, `high_corr_pairs.csv`, `scaling_before_after.png`, `clip_rate.csv`, `clip_rate.png`, `pca_explained_variance.png`, `projection_pca.png`, `projection_tsne.png`, `projection_umap.png` (chỉ khi có `umap-learn`), `eda_summary.md`. Phần 2 (`--latent`, Task 11b) thêm `latent_pca.png`, `latent_tsne.png`, `silhouette.csv`.
+
+Quyết định thiết kế:
+- Dữ liệu cho KS/tương quan/chuẩn hoá: tập train của bản mẫu, tối đa `--max-rows` dòng (lấy qua `read_split_frame`, seed 42). Mẫu phân tầng cho phép chiếu 2D: tối đa `--per-class` dòng mỗi nhãn từ cùng tập đó.
+- Thang log cho feature có thể âm (vd `Init Fwd Win Byts = -1`): dùng `sign(x)·log1p(|x|)`, ghi rõ trên trục.
+- Mục 3 dùng **boxplot** (spec cho phép violin/box): violin lỗi KDE khi một nhóm có giá trị hằng.
+- Silhouette (Task 11b) tính với `sample_size=5000` để tránh ma trận khoảng cách O(n²) quá lớn.
+- `eda_summary.md` được dựng lại từ các file đang có trong `--out` + bảng mô tả cố định `DESCRIPTIONS`, nên chạy phần 2 riêng không làm mất mô tả phần 1. Các số trong summary (tỷ lệ Benign/Attack, bảng làm sạch, số cặp tương quan cao, silhouette) đều do code tính từ file thật.
+- Thiếu `preprocess_stats.json` hoặc thiếu khoá `cleaning` → in `[skip]` cho mục 1–2, các mục khác vẫn chạy.
+
+- [ ] **Step 1: Viết test fail**
+
+`tests/test_eda.py`:
+```python
+import pandas as pd
+import pytest
+
+pytest.importorskip("sklearn")
+pytest.importorskip("scipy")
+pytest.importorskip("matplotlib")
+from analysis import eda  # noqa: E402
+from common.data import LABEL_COL  # noqa: E402
+from common.fake import FAKE_ATTACKS, make_fake_flows  # noqa: E402
+
+PART1 = ["label_distribution.png", "label_counts.csv", "cleaning_steps.csv", "ks_table.csv", "top_features_box.png",
+         "correlation_heatmap.png", "high_corr_pairs.csv", "scaling_before_after.png", "clip_rate.csv", "clip_rate.png",
+         "pca_explained_variance.png", "projection_pca.png", "projection_tsne.png", "eda_summary.md"]
+
+
+def test_stratified_sample():
+    df = make_fake_flows(2000)
+    s = eda.stratified_sample(df, per_class=100)
+    counts = s[LABEL_COL].value_counts()
+    assert set(counts.index) == {"Benign", *FAKE_ATTACKS} and (counts == 100).all()
+    pd.testing.assert_frame_equal(s, eda.stratified_sample(df, per_class=100))   # seed cố định
+
+
+def test_part1_smoke(tmp_path):
+    out = tmp_path / "eda"
+    eda.main(["--smoke", "--out", str(out), "--per-class", "150"])
+    missing = [f for f in PART1 if not (out / f).exists()]
+    assert missing == []
+    ks = pd.read_csv(out / "ks_table.csv")
+    assert list(ks.columns) == ["feature", "ks", "pvalue"] and ks["ks"].is_monotonic_decreasing
+    summary = (out / "eda_summary.md").read_text(encoding="utf-8")
+    for f in PART1:
+        if f.endswith(".png"):
+            assert "`%s`" % f in summary
+    assert not (out / "latent_pca.png").exists()
+
+
+def test_missing_stats_is_skipped(tmp_path):
+    from common.fake import write_fake_dataset
+    write_fake_dataset(tmp_path / "data", n=3000, scaler_path=tmp_path / "scaler.json")
+    out = tmp_path / "eda"
+    eda.main(["--data-dir", str(tmp_path / "data"), "--scaler", str(tmp_path / "scaler.json"),
+              "--stats", str(tmp_path / "none.json"), "--out", str(out), "--per-class", "100", "--skip-tsne"])
+    assert not (out / "label_distribution.png").exists() and (out / "projection_pca.png").exists()
+    assert not (out / "projection_tsne.png").exists()
+```
+
+Run: `.venv\Scripts\python -m pytest tests/test_eda.py -q` → FAIL (`No module named 'analysis.eda'`).
+
+- [ ] **Step 2: Viết `analysis/eda.py`**
+
+```python
+"""Trực quan hoá dữ liệu CSE-CIC-IDS2018 (PROJECT_SPEC 5.10) -> <out>/*.png + eda_summary.md.
+
+Phần 1 (sau preprocessing):
+  python analysis/eda.py --data-dir data/kaggle_sample --stats data/kaggle_sample/preprocess_stats.json
+Phần 2 (sau train DL, cần models/ae.pt, models/vae.pt):
+  python analysis/eda.py --latent --no-part1 --models-dir models
+Smoke (dữ liệu giả):  python analysis/eda.py --smoke [--latent]
+Feature có thể âm nên "thang log" là sign(x)*log1p(|x|).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from common import config as C  # noqa: E402
+from common.data import (BENIGN, CLIP, LABEL_COL, SEED, binarize, frame_to_matrix,  # noqa: E402
+                         load_scaler, read_split_frame)
+
+DPI = 150
+CORR_THRESHOLD = 0.95
+BENIGN_COLOR = "#9ca3af"
+DESCRIPTIONS = {
+    "label_distribution.png": "Số dòng theo từng loại nhãn (trục log), tách train/val/test, đếm trên toàn bộ dữ liệu sau tiền xử lý.",
+    "top_features_box.png": "Phân phối (thang sign·log1p) của các feature có KS Benign-vs-Attack lớn nhất, theo từng loại nhãn.",
+    "correlation_heatmap.png": "Tương quan Pearson giữa các feature trên Benign train, sắp theo hierarchical clustering.",
+    "scaling_before_after.png": "Histogram của 4 feature phân biệt nhất trước (sign·log1p) và sau chuẩn hoá + clip ±10.",
+    "clip_rate.png": "Tỷ lệ giá trị bị clip ở ±10 sau chuẩn hoá, 20 feature cao nhất.",
+    "pca_explained_variance.png": "Explained variance tích luỹ của PCA trên dữ liệu đã chuẩn hoá.",
+    "projection_pca.png": "Chiếu PCA 2D của mẫu phân tầng, tô màu theo loại nhãn.",
+    "projection_tsne.png": "Chiếu t-SNE 2D của cùng mẫu, tô màu theo loại nhãn.",
+    "projection_umap.png": "Chiếu UMAP 2D của cùng mẫu, tô màu theo loại nhãn.",
+    "latent_pca.png": "PCA 2D của dữ liệu gốc, latent AE và latent VAE (μ) trên cùng mẫu.",
+    "latent_tsne.png": "t-SNE 2D của dữ liệu gốc, latent AE và latent VAE (μ) trên cùng mẫu.",
+}
+
+
+def log(msg):
+    print("[eda] " + msg, flush=True)
+
+
+def symlog1p(x):
+    x = np.asarray(x, dtype=np.float64)
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def save(fig, path):
+    fig.tight_layout()
+    fig.savefig(path, dpi=DPI)
+    plt.close(fig)
+    log("wrote " + Path(path).name)
+
+
+def stratified_sample(df: pd.DataFrame, per_class: int, seed: int = SEED) -> pd.DataFrame:
+    parts = [g.sample(n=min(len(g), per_class), random_state=seed) for _, g in df.groupby(LABEL_COL, sort=True)]
+    return pd.concat(parts).reset_index(drop=True)
+
+
+def label_colors(labels):
+    attacks = sorted(set(labels) - {BENIGN})
+    cmap = plt.get_cmap("tab10")
+    colors = {a: cmap(i % 10) for i, a in enumerate(attacks)}
+    colors[BENIGN] = BENIGN_COLOR
+    return colors
+
+
+def scatter_by_label(ax, P, labels, title):
+    colors = label_colors(labels)
+    for lab in [BENIGN] + sorted(set(labels) - {BENIGN}):
+        m = labels == lab
+        if m.any():
+            ax.scatter(P[m, 0], P[m, 1], s=4, alpha=0.6, color=colors[lab], label=lab, rasterized=True)
+    ax.set_title(title)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def tsne_2d(X, perplexity):
+    from sklearn.manifold import TSNE
+    perp = min(perplexity, max(5.0, (len(X) - 1) / 3.0))
+    return TSNE(n_components=2, perplexity=perp, init="pca", random_state=SEED).fit_transform(X)
+
+
+# ---------- Phần 1 ----------
+def label_distribution(stats, out: Path):
+    ld = stats.get("label_distribution") if stats else None
+    if not ld:
+        return log("[skip] label distribution: thiếu preprocess_stats.json")
+    df = pd.DataFrame(ld).fillna(0).astype(int)
+    df = df.loc[df["train"].sort_values(ascending=True).index]
+    df.rename_axis("label").to_csv(out / "label_counts.csv")
+    fig, ax = plt.subplots(figsize=(8, 0.45 * len(df) + 1.5))
+    y = np.arange(len(df))
+    for i, split in enumerate(["train", "val", "test"]):
+        if split in df:
+            ax.barh(y + (i - 1) * 0.27, df[split], height=0.27, label=split)
+    ax.set_yticks(y)
+    ax.set_yticklabels(df.index)
+    ax.set_xscale("log")
+    ax.set(xlabel="số dòng (log)", title="Phân phối nhãn sau tiền xử lý")
+    ax.legend()
+    save(fig, out / "label_distribution.png")
+
+
+def cleaning_steps(stats, out: Path):
+    steps = stats.get("cleaning") if stats else None
+    if not steps:
+        return log("[skip] cleaning steps: preprocess_stats.json thiếu khoá 'cleaning' (chạy lại spark_preprocess.py bản mới)")
+    pd.DataFrame(steps).to_csv(out / "cleaning_steps.csv", index=False)
+    log("wrote cleaning_steps.csv")
+
+
+def ks_analysis(train: pd.DataFrame, features, top_k: int, sample: pd.DataFrame, out: Path) -> list:
+    from scipy.stats import ks_2samp
+    attack = train[LABEL_COL].to_numpy() != BENIGN
+    rows = []
+    for f in features:
+        x = train[f].to_numpy(dtype=np.float64)
+        r = ks_2samp(x[~attack], x[attack]) if attack.any() and (~attack).any() else None
+        rows.append({"feature": f, "ks": float(r.statistic) if r else np.nan, "pvalue": float(r.pvalue) if r else np.nan})
+    ks = pd.DataFrame(rows).sort_values("ks", ascending=False).reset_index(drop=True)
+    ks.to_csv(out / "ks_table.csv", index=False)
+    top = ks["feature"].head(top_k).tolist()
+    groups = [BENIGN] + sorted(set(sample[LABEL_COL]) - {BENIGN})
+    ncol = 4
+    nrow = int(np.ceil(len(top) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.2 * ncol, 3.4 * nrow), squeeze=False)
+    for ax, f in zip(axes.flat, top):
+        data = [symlog1p(sample.loc[sample[LABEL_COL] == g, f]) for g in groups]
+        ax.boxplot(data, showfliers=False)
+        ax.set_xticks(range(1, len(groups) + 1))
+        ax.set_xticklabels([g[:14] for g in groups], rotation=45, ha="right", fontsize=7)
+        ax.set_title("%s (KS=%.2f)" % (f, ks.set_index("feature").loc[f, "ks"]), fontsize=9)
+        ax.set_ylabel("sign·log1p", fontsize=8)
+    for ax in list(axes.flat)[len(top):]:
+        ax.axis("off")
+    save(fig, out / "top_features_box.png")
+    return top
+
+
+def correlation(train: pd.DataFrame, features, out: Path) -> int:
+    from scipy.cluster.hierarchy import leaves_list, linkage
+    from scipy.spatial.distance import squareform
+    benign = train.loc[train[LABEL_COL] == BENIGN, list(features)]
+    corr = benign.corr().fillna(0.0)
+    np.fill_diagonal(corr.values, 1.0)
+    dist = 1.0 - corr.abs().to_numpy()
+    np.fill_diagonal(dist, 0.0)
+    order = leaves_list(linkage(squareform(np.clip(dist, 0, None), checks=False), method="average"))
+    c = corr.iloc[order, order]
+    n = len(c)
+    fig, ax = plt.subplots(figsize=(0.16 * n + 4, 0.16 * n + 3))
+    im = ax.imshow(c.to_numpy(), cmap="RdBu_r", vmin=-1, vmax=1)
+    fs = 8 if n <= 30 else 5
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(c.columns, rotation=90, fontsize=fs)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(c.index, fontsize=fs)
+    fig.colorbar(im, ax=ax, shrink=0.7, label="Pearson r")
+    ax.set_title("Tương quan feature (Benign train)")
+    save(fig, out / "correlation_heatmap.png")
+    iu = np.triu_indices(n, k=1)
+    vals = corr.to_numpy()[iu]
+    mask = np.abs(vals) > CORR_THRESHOLD
+    pairs = pd.DataFrame({"feature_a": corr.index[iu[0][mask]], "feature_b": corr.columns[iu[1][mask]], "r": vals[mask]})
+    pairs = pairs.reindex(pairs["r"].abs().sort_values(ascending=False).index)
+    pairs.to_csv(out / "high_corr_pairs.csv", index=False)
+    return len(pairs)
+
+
+def scaling(train: pd.DataFrame, scaler, top: list, out: Path):
+    Z = frame_to_matrix(train, scaler)
+    rate = pd.DataFrame({"feature": scaler.features, "clip_rate": (np.abs(Z) >= CLIP).mean(axis=0)}) \
+        .sort_values("clip_rate", ascending=False)
+    rate.to_csv(out / "clip_rate.csv", index=False)
+    head = rate.head(20).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(7, 0.3 * len(head) + 1.5))
+    ax.barh(head["feature"], head["clip_rate"])
+    ax.set(xlabel="tỷ lệ giá trị bị clip ở ±%g" % CLIP, title="Clip sau chuẩn hoá")
+    save(fig, out / "clip_rate.png")
+    feats = top[:4]
+    idx = [scaler.features.index(f) for f in feats]
+    fig, axes = plt.subplots(2, len(feats), figsize=(4 * len(feats), 6), squeeze=False)
+    for j, (f, k) in enumerate(zip(feats, idx)):
+        axes[0, j].hist(symlog1p(train[f]), bins=60)
+        axes[0, j].set_title(f, fontsize=9)
+        axes[0, j].set_xlabel("gốc (sign·log1p)", fontsize=8)
+        axes[1, j].hist(Z[:, k], bins=60)
+        for v in (-CLIP, CLIP):
+            axes[1, j].axvline(v, color="red", ls="--", lw=1)
+        axes[1, j].set_xlabel("sau transform", fontsize=8)
+    save(fig, out / "scaling_before_after.png")
+
+
+def projections(X, labels, out: Path, skip_tsne: bool, perplexity: float, cache: dict):
+    from sklearn.decomposition import PCA
+    full = PCA(random_state=SEED).fit(X)
+    cum = np.cumsum(full.explained_variance_ratio_)
+    k95 = int(np.searchsorted(cum, 0.95) + 1)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(np.arange(1, len(cum) + 1), cum, marker=".")
+    ax.axhline(0.95, color="grey", ls=":")
+    ax.axvline(k95, color="grey", ls=":")
+    ax.set(xlabel="số thành phần", ylabel="explained variance tích luỹ",
+           title="PCA: %d thành phần đạt 95%%" % k95)
+    save(fig, out / "pca_explained_variance.png")
+    cache["pca_raw"] = full.transform(X)[:, :2]
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    scatter_by_label(ax, cache["pca_raw"], labels, "PCA 2D (dữ liệu chuẩn hoá)")
+    ax.legend(markerscale=3, fontsize=7)
+    save(fig, out / "projection_pca.png")
+    if not skip_tsne:
+        t0 = time.time()
+        cache["tsne_raw"] = tsne_2d(X, perplexity)
+        fig, ax = plt.subplots(figsize=(6.5, 5.5))
+        scatter_by_label(ax, cache["tsne_raw"], labels, "t-SNE 2D (perplexity %g)" % perplexity)
+        ax.legend(markerscale=3, fontsize=7)
+        save(fig, out / "projection_tsne.png")
+        log("t-SNE %.1fs" % (time.time() - t0))
+    try:
+        import umap
+    except ImportError:
+        return log("[skip] UMAP: chưa cài umap-learn")
+    P = umap.UMAP(n_components=2, random_state=SEED).fit_transform(X)
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    scatter_by_label(ax, P, labels, "UMAP 2D")
+    ax.legend(markerscale=3, fontsize=7)
+    save(fig, out / "projection_umap.png")
+
+
+# ---------- Tổng hợp ----------
+def md_table(df: pd.DataFrame) -> str:
+    cols = list(df.columns)
+    lines = ["| " + " | ".join(cols) + " |", "|" + "|".join(["---"] * len(cols)) + "|"]
+    for _, r in df.iterrows():
+        lines.append("| " + " | ".join(("%.4f" % v) if isinstance(v, float) else str(v) for v in r) + " |")
+    return "\n".join(lines)
+
+
+def write_summary(out: Path, timings: dict):
+    lines = ["# EDA — CSE-CIC-IDS2018", "", "## Hình", ""]
+    for name, desc in DESCRIPTIONS.items():
+        if (out / name).exists():
+            lines.append("- `%s` — %s" % (name, desc))
+    if (out / "label_counts.csv").exists():
+        lc = pd.read_csv(out / "label_counts.csv").set_index("label")
+        rows = []
+        for split in lc.columns:
+            b = int(lc.loc[BENIGN, split]) if BENIGN in lc.index else 0
+            a = int(lc[split].sum()) - b
+            rows.append({"split": split, "benign": b, "attack": a, "attack_ratio": a / max(a + b, 1)})
+        lines += ["", "## Benign / Attack theo tập", "", md_table(pd.DataFrame(rows))]
+    if (out / "cleaning_steps.csv").exists():
+        lines += ["", "## Hiệu quả làm sạch", "", md_table(pd.read_csv(out / "cleaning_steps.csv"))]
+    if (out / "high_corr_pairs.csv").exists():
+        n = len(pd.read_csv(out / "high_corr_pairs.csv"))
+        lines += ["", "## Tương quan", "", "Số cặp feature có |r| > %.2f trên Benign train: %d (chi tiết: `high_corr_pairs.csv`)."
+                  % (CORR_THRESHOLD, n)]
+    if (out / "silhouette.csv").exists():
+        lines += ["", "## Silhouette theo nhãn nhị phân", "", md_table(pd.read_csv(out / "silhouette.csv"))]
+    lines += ["", "## Thời gian chạy lần gần nhất (s)", "", md_table(pd.DataFrame([timings]))]
+    (out / "eda_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    log("wrote eda_summary.md")
+
+
+def fake_stats(data_dir: Path) -> dict:
+    """Chỉ dùng cho --smoke: stats giả có cùng cấu trúc với preprocess_stats.json."""
+    ld = {s: {k: int(v) for k, v in pd.read_parquet(data_dir / s)[LABEL_COL].value_counts().items()}
+          for s in ("train", "val", "test")}
+    n = sum(sum(v.values()) for v in ld.values())
+    return {"label_distribution": ld, "cleaning": [
+        {"step": "read_csv", "rows": n + 13, "rows_removed": 0, "cols": 18},
+        {"step": "drop_repeated_headers", "rows": n + 10, "rows_removed": 3, "cols": 18},
+        {"step": "drop_nan_inf", "rows": n + 4, "rows_removed": 6, "cols": 18},
+        {"step": "drop_constant_cols", "rows": n + 4, "rows_removed": 0, "cols": 17},
+        {"step": "drop_duplicates", "rows": n, "rows_removed": 4, "cols": 17}]}
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", default=None)
+    p.add_argument("--data-dir", default=None, help="mặc định data.sample_local_dir")
+    p.add_argument("--scaler", default=None, help="mặc định models.scaler")
+    p.add_argument("--stats", default="results/preprocess_stats.json")
+    p.add_argument("--out", default="reports/eda")
+    p.add_argument("--per-class", type=int, default=2000, help="số dòng tối đa mỗi nhãn cho phép chiếu 2D")
+    p.add_argument("--top-k", type=int, default=12)
+    p.add_argument("--max-rows", type=int, default=200000, help="số dòng train tối đa cho KS/tương quan/chuẩn hoá")
+    p.add_argument("--perplexity", type=float, default=30.0)
+    p.add_argument("--skip-tsne", action="store_true")
+    p.add_argument("--latent", action="store_true", help="phần 2: không gian latent AE/VAE + silhouette")
+    p.add_argument("--no-part1", action="store_true", help="bỏ mục 1-6 (dùng khi chỉ chạy thêm phần 2)")
+    p.add_argument("--models-dir", default="models", help="chứa ae.pt, vae.pt")
+    p.add_argument("--smoke", action="store_true", help="dữ liệu giả; với --latent sẽ train AE/VAE 2 epoch")
+    a = p.parse_args(argv)
+    cfg = C.load_config(a.config)
+    a.data_dir = a.data_dir or C.get(cfg, "data.sample_local_dir")
+    a.scaler = a.scaler or C.get(cfg, "models.scaler")
+    return a
+
+
+def prepare_smoke(a):
+    from common.fake import write_fake_dataset
+    tmp = Path(tempfile.mkdtemp(prefix="eda_smoke_"))
+    write_fake_dataset(tmp / "data", n=4000, scaler_path=tmp / "scaler.json")
+    (tmp / "stats.json").write_text(json.dumps(fake_stats(tmp / "data")), encoding="utf-8")
+    a.data_dir, a.scaler, a.stats = str(tmp / "data"), str(tmp / "scaler.json"), str(tmp / "stats.json")
+    if a.latent:
+        from train import train_dl
+        for kind in ("ae", "vae"):
+            train_dl.main(["--model", kind, "--data-dir", a.data_dir, "--scaler", a.scaler, "--epochs", "2",
+                           "--cpu", "--no-export", "--results-dir", str(tmp / "results"), "--models-dir", str(tmp / "models")])
+        a.models_dir = str(tmp / "models")
+
+
+def main(argv=None) -> dict:
+    a = parse_args(argv)
+    if a.smoke:
+        prepare_smoke(a)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    timings, cache = {}, {}
+    t = time.time()
+    scaler = load_scaler(a.scaler)
+    stats = json.loads(Path(a.stats).read_text(encoding="utf-8")) if Path(a.stats).exists() else None
+    train = read_split_frame(a.data_dir, "train", cap=a.max_rows)
+    sample = stratified_sample(train, a.per_class)
+    X = frame_to_matrix(sample, scaler)
+    labels = sample[LABEL_COL].astype(str).to_numpy()
+    timings["load"] = round(time.time() - t, 1)
+    log("train %d dòng, mẫu phân tầng %d dòng, %d feature" % (len(train), len(sample), len(scaler.features)))
+    if not a.no_part1:
+        steps = [
+            ("label_distribution", lambda: label_distribution(stats, out)),
+            ("cleaning", lambda: cleaning_steps(stats, out)),
+            ("ks", lambda: cache.__setitem__("top", ks_analysis(train, scaler.features, a.top_k, sample, out))),
+            ("correlation", lambda: correlation(train, scaler.features, out)),
+            ("scaling", lambda: scaling(train, scaler, cache["top"], out)),
+            ("projections", lambda: projections(X, labels, out, a.skip_tsne, a.perplexity, cache)),
+        ]
+        for name, fn in steps:
+            t = time.time()
+            fn()
+            timings[name] = round(time.time() - t, 1)
+    if a.latent:
+        t = time.time()
+        latent_space(X, labels, Path(a.models_dir), out, a.skip_tsne, a.perplexity, cache)
+        timings["latent"] = round(time.time() - t, 1)
+    write_summary(out, timings)
+    return timings
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`latent_space` được viết ở Task 11b. Ở Task 5b, thêm stub tạm ngay trên `main` để `--latent` báo lỗi rõ ràng:
+```python
+def latent_space(X, labels, models_dir, out, skip_tsne, perplexity, cache):
+    raise SystemExit("--latent cần Task 11b (analysis/eda.py phần 2)")
+```
+
+- [ ] **Step 3: Chạy test, xác nhận pass**
+
+Run: `.venv\Scripts\python -m pytest tests/test_eda.py -q`
+Expected: `3 passed` (< 1 phút).
+
+- [ ] **Step 4: Xem hình bằng mắt**
+
+Run: `.venv\Scripts\python analysis/eda.py --smoke --out .cache/eda_check --per-class 300`, rồi mở `top_features_box.png`, `correlation_heatmap.png`, `projection_tsne.png` bằng Read tool: chữ đọc được, legend không che dữ liệu, Benign màu xám, tấn công màu riêng.
+
+- [ ] **Step 5: README + commit**
+
+Thêm `scipy>=1.10` vào `requirements-kaggle.txt`. Thêm vào `README.md`:
+````markdown
+## Trực quan hoá dữ liệu (M1b) — Kaggle CPU hoặc laptop
+```bash
+python analysis/eda.py --data-dir data/kaggle_sample --scaler data/kaggle_sample/scaler.json \
+  --stats data/kaggle_sample/preprocess_stats.json --out reports/eda           # phần 1, mục 1-6
+python analysis/eda.py --latent --no-part1 --models-dir models --out reports/eda   # phần 2, sau train DL
+```
+Kết quả: `reports/eda/*.png` + `reports/eda/eda_summary.md`. UMAP chỉ vẽ khi đã `pip install umap-learn`.
+Chậm nhất là t-SNE; giảm `--per-class` (mặc định 2000) nếu vượt 10 phút.
+````
+
+```bash
+git add analysis/__init__.py analysis/eda.py tests/test_eda.py requirements-kaggle.txt README.md
+git commit -m "feat(analysis): EDA part 1 - label dist, cleaning, KS, correlation, scaling, 2D projections (M1b)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+Ghi chú: Task 11 cũng tạo `analysis/__init__.py`; nếu file đã có thì bỏ qua.
 
 ---
 
@@ -1744,7 +2264,7 @@ git commit -m "refactor(baselines): use common/ data+metrics, add --smoke/--resu
 
 **Interfaces:**
 - Consumes: không.
-- Produces: `MODEL_SPECS`, `AE`, `VAE`, `DAE`, `MLPClassifier`, `ReconScore`, `ProbScore`, `build_model`, `score_module`, `vae_loss`, `count_params` (mục Interfaces). AE/DAE `forward(x) -> recon`; VAE `forward(x) -> (recon, mu, logvar)` (eval dùng μ), `reconstruct_mean(x)`; MLP `forward(x) -> logits [batch]`; score module `forward(x) -> [batch]`.
+- Produces: `MODEL_SPECS`, `AE`, `VAE`, `DAE`, `MLPClassifier`, `ReconScore`, `ProbScore`, `build_model`, `score_module`, `vae_loss`, `count_params`, `encode_latent(model, x)` (AE/DAE: output encoder; VAE: μ), `save_checkpoint(path, kind, model, d, hidden, latent, noise_std)`, `load_checkpoint(path) -> (kind, model.eval())` (mục Interfaces). AE/DAE `forward(x) -> recon`; VAE `forward(x) -> (recon, mu, logvar)` (eval dùng μ), `reconstruct_mean(x)`; MLP `forward(x) -> logits [batch]`; score module `forward(x) -> [batch]`.
 
 Ghi chú kiến trúc: Linear → BatchNorm1d → ReLU cho mỗi tầng ẩn; tầng latent (bottleneck) và tầng ra là Linear thuần (không BN/ReLU). Nhiễu DAE nằm trong `forward` chỉ khi `self.training` → graph ONNX (eval) không có nhiễu.
 
@@ -1828,6 +2348,25 @@ def test_model_specs():
     assert {k: v["name"] for k, v in MODEL_SPECS.items()} == {
         "ae": "DeepAutoencoder", "vae": "VariationalAE", "dae": "DenoisingAE", "mlp": "DNN_Classifier"}
     assert isinstance(build_model("vae", D), VAE)
+
+
+@pytest.mark.parametrize("kind", ["ae", "vae"])
+def test_latent_and_checkpoint_roundtrip(tmp_path, kind):
+    from train.dl_models import encode_latent, load_checkpoint, save_checkpoint
+    m = build_model(kind, D, hidden=(64, 32), latent=8).eval()
+    x = _x()
+    z = encode_latent(m, x)
+    assert z.shape == (64, 8)
+    save_checkpoint(tmp_path / "m.pt", kind, m, D, (64, 32), 8, 0.1)
+    k2, m2 = load_checkpoint(tmp_path / "m.pt")
+    assert k2 == kind and not m2.training
+    torch.testing.assert_close(encode_latent(m2, x), z)
+
+
+def test_mlp_has_no_latent():
+    from train.dl_models import encode_latent
+    with pytest.raises(ValueError):
+        encode_latent(build_model("mlp", D), _x())
 ```
 
 - [ ] **Step 2: Chạy test, xác nhận fail**
@@ -1967,12 +2506,35 @@ def score_module(kind: str, model: nn.Module) -> nn.Module:
 
 def count_params(model: nn.Module) -> int:
     return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
+def encode_latent(model: nn.Module, x):
+    """Vector latent cho EDA: AE/DAE -> output encoder; VAE -> μ. (MLP không có latent.)"""
+    if isinstance(model, VAE):
+        return model.encode(x)[0]
+    if isinstance(model, AE):
+        return model.encoder(x)
+    raise ValueError("model không có latent: %s" % type(model).__name__)
+
+
+def save_checkpoint(path, kind: str, model: nn.Module, d: int, hidden, latent: int, noise_std: float) -> None:
+    torch.save({"kind": kind, "d": d, "hidden": list(hidden), "latent": latent, "noise_std": noise_std,
+                "state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()}}, str(path))
+
+
+def load_checkpoint(path):
+    """-> (kind, model ở chế độ eval trên CPU)."""
+    ck = torch.load(str(path), map_location="cpu")
+    model = build_model(ck["kind"], ck["d"], hidden=tuple(ck["hidden"]), latent=ck["latent"],
+                        noise_std=ck["noise_std"])
+    model.load_state_dict(ck["state_dict"])
+    return ck["kind"], model.eval()
 ```
 
 - [ ] **Step 4: Chạy test, xác nhận pass**
 
 Run: `.venv\Scripts\python -m pytest tests/test_dl_models.py -q`
-Expected: `8 passed`.
+Expected: `11 passed`.
 
 - [ ] **Step 5: Commit**
 
@@ -2044,6 +2606,7 @@ def test_smoke_all_models(tmp_path, kind):
     assert [o.name for o in sess.get_outputs()] == ["score"]
     if kind == "ae":
         assert (mdl / "threshold.json").exists() and (mdl / "ae.onnx").exists()
+    assert (mdl / ("%s.pt" % kind)).exists()
 
 
 def test_holdout_removes_attack_from_train(tmp_path):
@@ -2094,7 +2657,8 @@ if str(ROOT) not in sys.path:
 from common import config as C  # noqa: E402
 from common.data import SEED, load_scaler, load_split  # noqa: E402
 from common.metrics import METRIC_COLUMNS, evaluate, per_attack_recall, save_scores  # noqa: E402
-from train.dl_models import MODEL_SPECS, build_model, count_params, score_module, vae_loss  # noqa: E402
+from train.dl_models import (MODEL_SPECS, build_model, count_params, save_checkpoint,  # noqa: E402
+                             score_module, vae_loss)
 
 ONNX_OPSET = 17
 
@@ -2287,6 +2851,8 @@ def run(args) -> dict:
     n_params = count_params(model)
     model, hist, train_time = train_model(kind, model, tr, va, args, device)
     hist.to_csv(res / ("dl_%s_history.csv" % kind), index=False)
+    # state_dict + kiến trúc để analysis/eda.py --latent dựng lại encoder (PROJECT_SPEC 5.10 mục 7)
+    save_checkpoint(mdir / ("%s.pt" % kind), kind, model, d, hidden, args.latent, args.noise_std)
 
     smod = score_module(kind, model).to(device).eval()
     if supervised:
@@ -2368,6 +2934,7 @@ git commit -m "feat(train): train_dl for ae/vae/dae/mlp with eval + ONNX export 
 
 **Interfaces:**
 - Consumes: `train/train_dl.py`, `train/baselines.py` (flag `--data-dir --scaler --results-dir --holdout-attack`), `train/run_ablation.py` (Task 10: `--data-dir --scaler --base-results-dir --out-root --out-csv --only --epochs --cpu`), `analysis/make_report_assets.py` (Task 11: `--results-dir --reports-dir`).
+- Consumes thêm: `analysis/eda.py` (Task 5b/11b: `--data-dir --scaler --stats --out --latent --no-part1 --models-dir`).
 - Produces: `bash train/kaggle_run_all.sh <DATA_DIR> <SCALER_JSON>`; `SMOKE=1 bash train/kaggle_run_all.sh` chạy cả pipeline trên dữ liệu giả vào `.cache/smoke/`. Biến môi trường: `PY` (mặc định `python`), `HOLDOUT` (mặc định `DDOS attack-HOIC`; nếu `baselines.py` gốc có giá trị mặc định khác thì dùng giá trị đó), `STAGES` (mặc định `all`).
 
 Ghi chú: script này gọi Task 10 và 11. Viết xong Task 9 thì test cấu trúc trước (Step 3); bước chạy `SMOKE=1` đầy đủ nằm ở Task 11, Step 6.
@@ -2408,6 +2975,7 @@ Run: `.venv\Scripts\python -m pytest tests/test_kaggle_runner.py -q` → FAIL (f
 # Kaggle: bash train/kaggle_run_all.sh /kaggle/input/btl-cicids2018-sample /kaggle/input/btl-cicids2018-sample/scaler.json
 # Smoke:  SMOKE=1 bash train/kaggle_run_all.sh      (dữ liệu giả, CPU, ghi vào .cache/smoke)
 # Chạy một phần: STAGES="ae mlp" bash train/kaggle_run_all.sh ...
+# EDA phần 1 trên notebook CPU riêng (song song lúc GPU train): STAGES="eda" bash train/kaggle_run_all.sh ...
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -2421,10 +2989,12 @@ if [ "${SMOKE:-0}" = "1" ]; then
   "$PY" -m common.fake --out "$OUT/data" --n 4000
   DATA="$OUT/data"; SCALER="$OUT/data/scaler.json"
   RES="$OUT/results"; MOD="$OUT/models"; REP="$OUT/reports"
+  STATS="$OUT/no_stats.json"          # không có -> eda bỏ qua mục 1-2
   EXTRA=(--epochs 2 --cpu); HOLDOUT="Bot"
 else
   DATA="${1:?usage: kaggle_run_all.sh DATA_DIR SCALER_JSON}"; SCALER="${2:?SCALER_JSON}"
   RES=results; MOD=models; REP=reports; EXTRA=()
+  STATS="${STATS:-$(dirname "$SCALER")/preprocess_stats.json}"
   mkdir -p "$MOD"
   cp "$SCALER" "$MOD/scaler.json"; SCALER="$MOD/scaler.json"
 fi
@@ -2439,6 +3009,8 @@ want ae        && { step "AE";        dl ae; }
 want mlp       && { step "MLP";       dl mlp; }
 want vae       && { step "VAE";       dl vae; }
 want baselines && { step "Baselines"; "$PY" train/baselines.py "${COMMON[@]}" --results-dir "$RES"; }
+want eda       && { step "EDA phần 1"; "$PY" analysis/eda.py "${COMMON[@]}" --stats "$STATS" --out "$REP/eda"; }
+want eda_latent && { step "EDA latent"; "$PY" analysis/eda.py "${COMMON[@]}" --latent --no-part1   --models-dir "$MOD" --out "$REP/eda"; }
 want abl1      && { step "Ablation latent + threshold"; ablation latent,threshold; }
 want dae       && { step "DAE";       dl dae; }
 want abl2      && { step "Ablation depth"; ablation depth; }
@@ -2473,6 +3045,10 @@ Lưu ý: dòng `want x && {...}` trả mã 1 khi stage bị bỏ qua, nên scrip
    "os.chdir('/kaggle/working/repo')"]},
   {"cell_type": "code", "metadata": {}, "execution_count": null, "outputs": [], "source": [
    "!SMOKE=1 bash train/kaggle_run_all.sh"]},
+  {"cell_type": "markdown", "metadata": {}, "source": [
+   "EDA phần 1 chỉ cần CPU: có thể chạy ở một notebook CPU riêng song song với notebook GPU bằng ô dưới (bỏ qua ô này ở notebook GPU)."]},
+  {"cell_type": "code", "metadata": {}, "execution_count": null, "outputs": [], "source": [
+   "!STAGES=\"eda\" bash train/kaggle_run_all.sh /kaggle/input/btl-cicids2018-sample /kaggle/input/btl-cicids2018-sample/scaler.json"]},
   {"cell_type": "code", "metadata": {}, "execution_count": null, "outputs": [], "source": [
    "!bash train/kaggle_run_all.sh /kaggle/input/btl-cicids2018-sample /kaggle/input/btl-cicids2018-sample/scaler.json 2>&1 | tee results_run.log"]},
   {"cell_type": "code", "metadata": {}, "execution_count": null, "outputs": [], "source": [
@@ -3134,6 +3710,106 @@ git commit -m "feat(analysis): report tables and figures (M2b)" -m "Co-Authored-
 ```
 
 Báo người dùng: chạy notebook trên Kaggle (Task 9 README), tải `outputs.zip` về.
+
+---
+
+### Task 11b: `analysis/eda.py --latent` — không gian latent + silhouette (M2b)
+
+**Files:**
+- Modify: `analysis/eda.py` (thay stub `latent_space`)
+- Test: `tests/test_eda.py` (thêm test)
+
+**Interfaces:**
+- Consumes: `train.dl_models.load_checkpoint`, `train.dl_models.encode_latent` (Task 7), `models/ae.pt`, `models/vae.pt` (Task 8); `cache["pca_raw"]`, `cache["tsne_raw"]` do `projections` của Task 5b điền khi chạy cùng phần 1.
+- Produces: `latent_pca.png`, `latent_tsne.png` (figure 1×3: dữ liệu gốc | latent AE | latent VAE μ, cùng mẫu phân tầng), `silhouette.csv` (cột `representation, dim, silhouette`; dòng `raw`, `AE latent`, `VAE latent (mu)`), và bảng silhouette trong `eda_summary.md`.
+
+- [ ] **Step 1: Viết test fail**
+
+Thêm vào `tests/test_eda.py`:
+```python
+def test_latent_smoke(tmp_path):
+    pytest.importorskip("torch")
+    out = tmp_path / "eda"
+    eda.main(["--smoke", "--latent", "--out", str(out), "--per-class", "150"])
+    for f in ("latent_pca.png", "latent_tsne.png", "silhouette.csv"):
+        assert (out / f).exists(), f
+    sil = pd.read_csv(out / "silhouette.csv")
+    assert list(sil.columns) == ["representation", "dim", "silhouette"]
+    assert sil["representation"].tolist() == ["raw", "AE latent", "VAE latent (mu)"]
+    assert sil["silhouette"].between(-1, 1).all()
+    assert "Silhouette" in (out / "eda_summary.md").read_text(encoding="utf-8")
+
+
+def test_latent_only_keeps_part1_descriptions(tmp_path):
+    pytest.importorskip("torch")
+    out = tmp_path / "eda"
+    eda.main(["--smoke", "--out", str(out), "--per-class", "100", "--skip-tsne"])
+    eda.main(["--smoke", "--latent", "--no-part1", "--out", str(out), "--per-class", "100", "--skip-tsne"])
+    summary = (out / "eda_summary.md").read_text(encoding="utf-8")
+    assert "`projection_pca.png`" in summary and "`latent_pca.png`" in summary
+```
+
+Run: `.venv\Scripts\python -m pytest tests/test_eda.py -q` → 2 test mới FAIL (`SystemExit: --latent cần Task 11b`).
+
+- [ ] **Step 2: Thay stub `latent_space` trong `analysis/eda.py`**
+
+```python
+def latent_space(X, labels, models_dir: Path, out: Path, skip_tsne: bool, perplexity: float, cache: dict):
+    """Mục 7-8: latent AE (encoder) và VAE (μ) trên cùng mẫu với hình chiếu dữ liệu gốc."""
+    import torch
+    from sklearn.decomposition import PCA
+    from sklearn.metrics import silhouette_score
+
+    from train.dl_models import encode_latent, load_checkpoint
+    panels = [("raw", "Dữ liệu gốc (chuẩn hoá)", X)]
+    for kind, key, title in (("ae", "AE latent", "Latent AE"), ("vae", "VAE latent (mu)", "Latent VAE (μ)")):
+        p = models_dir / ("%s.pt" % kind)
+        if not p.exists():
+            log("[skip] %s: không có %s" % (key, p))
+            continue
+        _, model = load_checkpoint(p)
+        with torch.no_grad():
+            Z = encode_latent(model, torch.from_numpy(np.ascontiguousarray(X))).numpy()
+        panels.append((key, title, Z))
+    if len(panels) == 1:
+        return log("[skip] latent: không có ae.pt / vae.pt trong %s" % models_dir)
+
+    def figure(proj_key, project, name, method):
+        fig, axes = plt.subplots(1, len(panels), figsize=(5.5 * len(panels), 5), squeeze=False)
+        for ax, (key, title, M) in zip(axes[0], panels):
+            P = cache[proj_key] if key == "raw" and proj_key in cache else project(M)
+            scatter_by_label(ax, P, labels, "%s — %s (%d chiều)" % (title, method, M.shape[1]))
+        axes[0, -1].legend(markerscale=3, fontsize=7, loc="best")
+        save(fig, out / name)
+
+    figure("pca_raw", lambda M: PCA(n_components=2, random_state=SEED).fit_transform(M), "latent_pca.png", "PCA")
+    if not skip_tsne:
+        figure("tsne_raw", lambda M: tsne_2d(M, perplexity), "latent_tsne.png", "t-SNE")
+    y = binarize(labels)
+    if len(np.unique(y)) < 2:
+        return log("[skip] silhouette: mẫu chỉ có một lớp")
+    rows = [{"representation": key, "dim": int(M.shape[1]),
+             "silhouette": float(silhouette_score(M, y, sample_size=min(5000, len(M)), random_state=SEED))}
+            for key, _, M in panels]
+    pd.DataFrame(rows).to_csv(out / "silhouette.csv", index=False)
+    log("wrote silhouette.csv")
+```
+
+- [ ] **Step 3: Chạy test, xác nhận pass**
+
+Run: `.venv\Scripts\python -m pytest tests/test_eda.py -q`
+Expected: `5 passed`.
+
+- [ ] **Step 4: Xem hình bằng mắt**
+
+Run: `.venv\Scripts\python analysis/eda.py --smoke --latent --out .cache/eda_check --per-class 300`, mở `latent_pca.png` và `latent_tsne.png` bằng Read tool: 3 panel cùng cỡ, tiêu đề ghi số chiều, legend ở panel cuối không che dữ liệu.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add analysis/eda.py tests/test_eda.py
+git commit -m "feat(analysis): EDA part 2 - AE/VAE latent space projections + silhouette (M2b)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
 
 ---
 
@@ -4588,6 +5264,7 @@ git commit -m "docs: final README with run commands and result pointers" -m "Co-
 | 5.2 baselines | 6 |
 | 5.3 dl_models / train_dl / ablation | 7, 8, 10 (+ 9 Kaggle) |
 | 5.4 make_report_assets | 11 |
+| 5.10 eda (phần 1 / phần 2) | 5b / 11b (+ Task 5 ghi `cleaning`, Task 7–8 lưu `.pt`) |
 | 5.5 producer | 12 |
 | 5.6 stream_detect | 13, 14 |
 | 5.7 benchmark | 16 |

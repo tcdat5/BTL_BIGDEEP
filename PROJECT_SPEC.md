@@ -52,7 +52,8 @@ Sản phẩm cuối phải có đủ:
 │   ├── run_ablation.py       # chạy lưới ablation cho AE, gộp kết quả
 │   └── kaggle_notebook.ipynb # hoặc hướng dẫn chạy 2 script trên Kaggle
 ├── analysis/
-│   └── make_report_assets.py # gộp metric, vẽ biểu đồ -> reports/
+│   ├── make_report_assets.py # gộp metric, vẽ biểu đồ -> reports/
+│   └── eda.py                # trực quan hoá dữ liệu -> reports/eda/
 ├── streaming/
 │   ├── producer.py           # replay test set vào Kafka với tốc độ chỉnh được
 │   ├── stream_detect.py      # Spark Structured Streaming + ONNX
@@ -186,6 +187,25 @@ Output: `results/ablation.csv` với cột `experiment, value, precision, recall
 ### 5.9 `scripts/check_cluster.sh`
 Kiểm tra: `hdfs dfsadmin -report` (số datanode sống), Spark master UI phản hồi + số worker, tạo/gửi/nhận thử message Kafka. In PASS/FAIL từng mục.
 
+### 5.10 `analysis/eda.py` — trực quan hoá dữ liệu (chạy trên Kaggle CPU hoặc laptop)
+Input: Parquet mẫu (`data/kaggle_sample/` = Kaggle Dataset), `models/scaler.json`, `results/preprocess_stats.json`. Đọc qua `common/data.py`. Output: `reports/eda/*.png` (dpi 150) + `reports/eda/eda_summary.md`. Mọi phép chiếu 2D dùng **mẫu phân tầng** (tối đa 2.000 dòng mỗi loại nhãn, `--per-class`), seed 42.
+
+**Phần 1 — chạy ngay sau preprocessing (M1):**
+1. **Phân phối nhãn**: bar trục log số dòng theo từng loại tấn công, tách train/val/test; kèm tỷ lệ Benign/Attack. Lấy từ `preprocess_stats.json` (đếm trên toàn bộ dữ liệu, không phải mẫu).
+2. **Hiệu quả làm sạch**: bảng số dòng trước/sau từng bước (header lặp, NaN/Inf, trùng lặp, cột hằng bị bỏ) từ `preprocess_stats.json`. Nếu preprocessing chưa ghi đủ các số này thì bổ sung vào `spark_preprocess.py`.
+3. **Feature phân biệt nhất**: tính KS statistic Benign vs Attack cho mọi feature → top 12; vẽ violin/box trên thang `log1p` (Benign vs từng loại tấn công). Lưu bảng KS đầy đủ ra CSV.
+4. **Tương quan**: heatmap Pearson trên Benign train (sắp theo hierarchical clustering); liệt kê các cặp |r| > 0.95. Dùng để lập luận dữ liệu dư thừa → hợp với nén bằng AE.
+5. **Sau chuẩn hoá**: histogram vài feature trước/sau `transform`; tỷ lệ giá trị bị clip ở ±10 cho từng feature.
+6. **Chiếu 2D dữ liệu gốc** (đã chuẩn hoá), tô màu theo loại nhãn: PCA (kèm biểu đồ explained variance tích luỹ), t-SNE (perplexity 30), UMAP nếu cài được `umap-learn` (bỏ qua nếu không có, không làm lỗi).
+
+**Phần 2 — sau khi train DL (M2a), cờ `--latent`:**
+7. **Không gian latent**: lấy vector latent của AE (encoder output) và VAE (μ) trên **cùng mẫu** ở mục 6 → chiếu PCA/t-SNE 2D, đặt cạnh hình PCA dữ liệu gốc (figure 1×3). Đây là hình minh hoạ chính cho phần Deep Learning: biểu diễn học được tách Benign/Attack thế nào so với dữ liệu gốc.
+   - Yêu cầu `train_dl.py` lưu thêm `models/<kind>.pt` (state_dict + tham số kiến trúc) để `eda.py` dựng lại encoder. ONNX không đổi.
+8. Tính thêm **silhouette score** theo nhãn nhị phân trên dữ liệu gốc vs latent AE vs latent VAE → bảng nhỏ trong `eda_summary.md` (định lượng cho hình mục 7).
+
+`eda_summary.md`: liệt kê mọi hình kèm 1 câu mô tả *cái hình thể hiện* (không diễn giải kết quả bằng số chưa tính).
+Thời gian chạy mục tiêu: < 10 phút trên Kaggle CPU (t-SNE là phần chậm nhất; giảm `--per-class` nếu cần).
+
 ## 6. Thứ tự thực hiện (milestone)
 
 | # | Hạn | Việc | Tiêu chí xong |
@@ -193,7 +213,8 @@ Kiểm tra: `hdfs dfsadmin -report` (số datanode sống), Spark master UI ph�
 | M0 | Thứ 2 tối | Khung repo, `config.example.yaml`, `common/`, `check_cluster.sh`, README | Repo chạy `pip install` được, script check chạy |
 | M1 | Thứ 3 trưa | `spark_preprocess.py` | Có Parquet train/val/test + `scaler.json` + bản mẫu để upload Kaggle |
 | M2a | Thứ 3 chiều | `dl_models.py`, `train_dl.py` (làm AE trước, rồi VAE/DAE/MLP), refactor `baselines.py` | Có `ae.onnx`, `threshold.json`; 4 model DL + 6 baseline chạy xong trên Kaggle |
-| M2b | Thứ 3 tối | `run_ablation.py`, holdout, `make_report_assets.py` | Có `ablation.csv`, bảng so sánh 10 model + toàn bộ hình |
+| M1b | Thứ 3 chiều | `analysis/eda.py` phần 1 (mục 1–6) — chạy trên Kaggle CPU song song lúc GPU train | Có `reports/eda/` với hình phân phối nhãn, KS, tương quan, PCA/t-SNE |
+| M2b | Thứ 3 tối | `run_ablation.py`, holdout, `make_report_assets.py`, `eda.py --latent` (mục 7–8) | Có `ablation.csv`, bảng so sánh 10 model, hình latent space + toàn bộ hình |
 | M3 | Thứ 4 chiều | `producer.py`, `stream_detect.py` | Chạy end-to-end trên cụm, F1 streaming ≈ F1 offline của AE |
 | M4 | Thứ 4 tối | `dashboard/app.py` | Dashboard hiện cảnh báo khi producer đang chạy |
 | M5 | Thứ 5 sáng | `benchmark.py` + script chạy các mức rate | Có `streaming_benchmark.csv` + hình |

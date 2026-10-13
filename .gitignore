@@ -11,6 +11,7 @@ metastore_db/
 derby.log
 .ipynb_checkpoints/
 models/*.onnx
+models/*.pt
 results/**/*.npz
 results/**/*.npy
 results/stream/
