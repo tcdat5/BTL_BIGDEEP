@@ -21,6 +21,22 @@ python3 -m pip install --user -r requirements-cluster.txt   # trên CẢ 3 VM
 ```
 Đọc một giá trị config trong shell: `python3 scripts/cfg.py cluster.kafka_bootstrap`.
 
+## Tiền xử lý
+- Giá trị lỗi: dòng có null/NaN/±Infinity ở **bất kỳ** feature nào bị **bỏ**.
+- Bỏ cột định danh `Flow ID, Src IP, Dst IP, Src Port, Dst Port`; `Timestamp` giữ thành metadata `orig_ts`; bỏ cột hằng.
+- Gộp dòng trùng (feature + Label), giữ `orig_ts` nhỏ nhất.
+- Chia tập **tất định bằng hash** (giống hệt nhau trên Kaggle và trên cụm, không phụ thuộc số partition):
+  `flow_id = xxhash64(feature..., Label)`, `bucket = pmod(flow_id, 100)`: `<70` train, `70–79` val, `≥80` test.
+- Xuất thêm: bản mẫu Kaggle (`data.sample_sizes`), `data/demo_test.parquet` (50.000 dòng test phân tầng, mỗi
+  loại tấn công ≥ min(500, số có)), `models/scaler.json`, `results/preprocess_stats.json`.
+```bash
+# Kaggle / local
+python preprocess/spark_preprocess.py --master "local[*]" --input-dir <thư mục CSV> --out data/processed \
+  --export-sample data/kaggle_sample --demo-out data/demo_test.parquet --scaler-out models/scaler.json
+# Cụm (sau này)
+bash scripts/run_preprocess.sh
+```
+
 ## Test local
 ```powershell
 py -3.12 -m venv .venv
