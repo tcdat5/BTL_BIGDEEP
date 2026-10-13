@@ -37,6 +37,39 @@ python preprocess/spark_preprocess.py --master "local[*]" --input-dir <thư mụ
 bash scripts/run_preprocess.sh
 ```
 
+## Chạy trên Kaggle (Deep Learning, toàn bộ pipeline)
+Notebook: `train/kaggle_notebook.ipynb` (sinh từ `train/make_notebook.py`), logic trong `train/kaggle_run_all.py`.
+1. Kaggle → **Create → New Notebook** → **File → Import Notebook** → chọn `train/kaggle_notebook.ipynb`.
+2. **Add Data**: dataset CSV CSE-CIC-IDS2018 có 4 ngày 14-02, 16-02, 21-02, 02-03-2018. Sửa `RAW_DIR` trong ô tham số
+   thành thư mục `/kaggle/input/<tên dataset>` (notebook tìm CSV đệ quy; tên file khác config được tự khớp theo ngày,
+   hoặc đặt `FILE_MAP`).
+3. **Settings → Accelerator: GPU T4 x2** (hoặc P100); **Internet: On**.
+4. Lấy mã nguồn — một trong hai cách:
+   - repo public: để `REPO_URL` đúng, `CODE_DATASET = ""` (notebook `git clone`);
+   - repo private: trên laptop `git archive -o btl_code.zip HEAD`, upload thành Kaggle Dataset (vd `btl-bigdeep-code`),
+     Add Data vào notebook, đặt `CODE_DATASET = "/kaggle/input/btl-bigdeep-code"`.
+5. Đặt `QUICK = True` → **Save Version → Save & Run All** (thử < 15 phút). Ổn thì `QUICK = False` và chạy lại.
+6. Tab **Output** của version → tải `kaggle_outputs.zip`.
+
+Bước lỗi: in traceback rồi chạy tiếp; preprocess hoặc AE lỗi thì dừng. Bảng thời gian: `results/kaggle_timing.csv`.
+Thử cục bộ (Docker giống Kaggle: Python 3.12 + Java 17):
+```bash
+docker compose -f docker/docker-compose.test.yml --profile kaggle build kaggle
+docker compose -f docker/docker-compose.test.yml --profile kaggle run --rm kaggle sh -c \
+  "python -m common.fake --raw-csv .cache/quick/input --n 3000 && python train/kaggle_run_all.py --raw-dir .cache/quick/input --work-dir .cache/quick/working --quick"
+```
+
+## Dashboard trên laptop (replay, không cần Kafka/Spark/PyTorch)
+```powershell
+# trong thư mục repo: giải nén output Kaggle -> models/ results/ reports/ data/demo_test.parquet
+Expand-Archive -Force kaggle_outputs.zip .
+pip install -r requirements-dashboard.txt
+streamlit run dashboard/app.py                     # mặc định --source replay
+```
+Sidebar: chọn model (mọi `models/*.onnx`), cách đặt ngưỡng (đã lưu / percentile val Benign / tự chỉnh), tốc độ phát,
+Start/Pause/Reset, "Phát nhanh 1.000 flow". Tab: Giám sát (không nhãn) · Đánh giá (nhãn thật) · Kết quả nghiên cứu.
+Nguồn Spark Streaming (sau này): `streamlit run dashboard/app.py -- --source stream --stream-dir results/stream/default`.
+
 ## Test local
 ```powershell
 py -3.12 -m venv .venv

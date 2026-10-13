@@ -223,7 +223,8 @@ def main(argv=None) -> dict:
     stats = {"timings_s": {}, "rows": {}, "files": list(a.files)}
     t_all = time.time()
     spark = build_spark(a)
-    paths = ["%s/%s" % (a.input_dir.rstrip("/"), f) for f in a.files]
+    # --files nhận tên file (ghép với --input-dir) hoặc đường dẫn đầy đủ (/... hoặc hdfs://...)
+    paths = [f if (f.startswith("/") or "://" in f) else "%s/%s" % (a.input_dir.rstrip("/"), f) for f in a.files]
 
     with timed(stats, "read_clean"):
         lines, id_dropped = read_raw(spark, paths)

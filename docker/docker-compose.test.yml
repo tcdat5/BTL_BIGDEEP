@@ -31,5 +31,16 @@ services:
     depends_on:
       - kafka
     working_dir: /repo
+  kaggle:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.kaggle-test
+    volumes:
+      - ..:/repo
+    environment:
+      BTL_CONFIG: /repo/config.example.yaml
+      PYTHONIOENCODING: utf-8
+    working_dir: /repo
+    profiles: ["kaggle"]
 volumes:
   ivy-cache: {}
