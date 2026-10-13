@@ -31,7 +31,73 @@
 
 ---
 
-## Lịch (hôm nay thứ 2, 12/10/2026 — deadline sáng thứ 6, 16/10)
+## Sửa đổi 13/10/2026 — Deep Learning trước, toàn bộ trên Kaggle + dashboard replay trên laptop
+
+> Mục này **thắng** mọi chỗ mâu thuẫn ở phần dưới. Phần Big Data (Phụ lục A, Kafka, Spark Streaming trên cụm, benchmark — Task 4 phần cụm, 12, 13 (trừ `scorer.py`/`output_io.py`), 14, 16) **tạm hoãn**, không xoá. Lý do: cụm VM chưa có Internet và bị hạn chế quyền.
+> Code vẫn phải chạy lại được trên cụm sau này mà không sửa logic: cùng `spark_preprocess.py`, cùng `common/`, cùng cách chia tập, cùng file ONNX.
+
+Mốc nội bộ: Kaggle chạy xong AE + baselines **tối thứ 3 (13/10)**; toàn bộ DL + dashboard replay **tối thứ 4 (14/10)**; deadline cứng sáng thứ 6 (16/10).
+
+### Thứ tự mới (cắt từ dưới lên khi thiếu giờ; 1–6 bắt buộc)
+
+| # | Việc | Task gốc + thay đổi |
+|---|---|---|
+| 1 | Cập nhật plan | mục này |
+| 2 | `common/` (data, metrics, fake) + test venv + Docker Py3.8 | Task 2, 3 (không đổi) |
+| 3 | `spark_preprocess.py`: chia hash + stats + `demo_test.parquet` + test Docker | Task 5 + **S1, S2** dưới đây |
+| 4 | `dl_models.py` + `train_dl.py` (AE trước) + `--smoke`; refactor `baselines.py` (file người dùng copy vào) | Task 6, 7, 8 |
+| 5 | Notebook Kaggle chạy được `QUICK=True` (preprocess → AE → baselines → đóng gói), thử cục bộ trên CSV giả | Task 9 → **S3** |
+| 6 | Dashboard nguồn `replay` dùng model AE từ smoke/quick | Task 15 → **S4** (+ `streaming/scorer.py`, `streaming/output_io.py` từ Task 13) |
+| 7 | MLP → VAE → DAE trên Kaggle | Task 8 |
+| 8 | EDA phần 1, `make_report_assets.py` | Task 5b, 11 |
+| 9 | Ablation latent/ngưỡng, holdout (S5), EDA `--latent` | Task 10, 11b |
+| 10 | Ablation độ sâu, VAE β | Task 10 |
+| 11 | Nguồn `stream` của dashboard (test bằng dữ liệu giả) | S4 |
+| 12 | Quay lại streaming/Kafka/benchmark + Phụ lục A | Task 4 (phần cụm), 12–14, 16 |
+
+### S1. Chia tập tất định bằng hash (thay `rand(seed)` ở Task 5)
+- Sau `dropDuplicates`: `bucket = pmod(xxhash64(<mọi cột feature theo thứ tự cố định>, Label), 100)`; `< 70` → train, `70–79` → val, `>= 80` → test. Kết quả chia **giống hệt nhau** bất kể số partition (Kaggle `local[*]` hay cụm).
+- `flow_id` cũng phải tất định: `flow_id = xxhash64(<feature...>, Label)` (sau dedup nên duy nhất; không dùng `monotonically_increasing_id` vì phụ thuộc partition).
+- Test: cùng dữ liệu giả, chạy với `repartition(1)` và `repartition(8)` (tham số ẩn `--debug-repartition N`) → tập `flow_id` của train/val/test giống hệt nhau.
+- Đường dẫn input là thư mục local (Kaggle) hoặc `hdfs://`; danh sách file từ `data.raw_files`, ghi đè được bằng `--files`.
+
+### S2. `preprocess_stats.json` và bản mẫu
+- `stats["cleaning"]` như Task 5 (đọc vào, bỏ header lặp, bỏ NaN/Inf, bỏ cột hằng, bỏ trùng); thêm `stats["dropped_columns"] = {"identifier": [...có trong dữ liệu...], "constant": [...]}`; `label_distribution` theo tập; `timings_s`.
+- Bản mẫu Kaggle (`data.sample_sizes`) ra `--export-sample` (mặc định `data.sample_local_dir`).
+- **`--demo-out data/demo_test.parquet`**: 50.000 dòng (`--demo-rows`) lấy từ test, phân tầng theo Label: mỗi loại tấn công lấy `min(500, số dòng có)` trước, phần còn lại chia theo tỷ lệ; seed 42; giữ `flow_id`, `orig_ts`, `Label` + feature. Ghi thành **một file** Parquet (coalesce(1) rồi đổi tên part file; khi output là `hdfs://` thì ghi thư mục).
+- Danh sách tấn công thực sự có trong dữ liệu nằm ở `stats["label_distribution"]` — holdout (S5) đọc từ đây.
+
+### S3. Notebook Kaggle (`train/kaggle_notebook.ipynb`) + `train/kaggle_run_all.py`
+Thay `kaggle_run_all.sh` bằng **`train/kaggle_run_all.py`** (Python: dễ bắt lỗi từng bước, đo thời gian, chạy tiếp khi lỗi). Notebook chỉ đặt tham số và gọi script này theo từng ô. "Save Version → Save & Run All" chạy một lượt.
+1. Thiết lập: in GPU/CPU/RAM; lấy code (`git clone` repo public, hoặc copy từ Kaggle Dataset mã nguồn); `pip install` gói thiếu từ `requirements-kaggle.txt` + `pyspark==3.5.1`.
+2. Java: `java -version`; thiếu thì `apt-get install -y openjdk-17-jre-headless`, đặt `JAVA_HOME` (Spark 3.5.1 hỗ trợ Java 17).
+3. Tìm dữ liệu: tham số `RAW_DIR`; liệt kê CSV; báo lỗi rõ nếu thiếu file trong `data.raw_files`; `FILE_MAP` cho phép map tên file khác.
+4. Preprocess `--master local[*]`, `--driver-memory` = 70% RAM.
+5. EDA phần 1. 6. `train_dl` ae → mlp → vae → dae. 7. baselines. 8. ablation + holdout. 9. EDA `--latent` + `make_report_assets`.
+10. Đóng gói `/kaggle/working/{models,results,reports,data/demo_test.parquet}` + `kaggle_outputs.zip`; bảng thời gian từng bước + `results/kaggle_timing.csv`.
+- `QUICK=True`: 1 file CSV, cap nhỏ (train 50k, test 20k), 3 epoch, chạy < 15 phút.
+- Bước lỗi: in traceback rồi chạy tiếp; **preprocess hoặc AE lỗi thì dừng**.
+- Thử cục bộ trước: `QUICK=True` trên CSV giả của `common.fake.write_fake_raw_csvs`, mô phỏng đường dẫn Kaggle qua `RAW_DIR`/`WORK_DIR`.
+
+### S4. Dashboard 2 nguồn (thay Task 15)
+`streamlit run dashboard/app.py -- --source replay` (mặc định `replay`). Logic thuần trong `dashboard/view_model.py` (có test), UI trong `app.py`; Python 3.8.
+- **replay**: đọc `data/demo_test.parquet`, chấm điểm bằng `streaming.scorer.OnnxScorer` theo lô; tốc độ (flow/giây) chỉnh được; Start/Pause/Reset; thứ tự trộn seed 42 hoặc theo `orig_ts`. Không cần Kafka/Spark/PyTorch.
+- **stream**: đọc thư mục output Spark qua `streaming.output_io.load_output`; viết sẵn, test bằng dữ liệu giả.
+- Sidebar: nguồn; chọn model (`models/*.onnx` + `threshold_<kind>.json`); thanh trượt ngưỡng (mặc định = ngưỡng đã lưu; chọn theo percentile val Benign nếu có `results/valscores_<Name>.npy`); tốc độ.
+- Tab **Giám sát** (không nhãn thật): flow đã xử lý, cảnh báo, tỷ lệ, throughput; flow/cảnh báo theo thời gian; score theo thời gian + đường ngưỡng; bảng flow đáng ngờ nhất.
+- Tab **Đánh giá**: P/R/F1/FPR, confusion matrix, recall theo loại tấn công — cập nhật ngay khi kéo ngưỡng.
+- Tab **Kết quả nghiên cứu**: `reports/model_comparison.md`, hình trong `reports/` và `reports/eda/` kèm chú thích từ `eda_summary.md`; thiếu thì ghi "chưa có".
+- Tiếng Việt, chữ đủ to khi chiếu.
+
+### S5. Holdout
+Chạy `baselines.py` và `train_dl.py --model mlp` với `--holdout-attack` cho **Bot**, **DDOS attack-HOIC**, **SSH-Bruteforce**, mỗi loại vào `results/holdout/<slug>/`; loại nào không có trong `label_distribution` thì bỏ qua và in cảnh báo. `make_report_assets.py` duyệt mọi `results/holdout/*/holdout.json`.
+
+### Tự kiểm tra mỗi bước
+`pytest` pass (venv + Docker Py3.8 cho code chạy trên cụm); `train_dl.py --smoke` pass 4 model và ONNX đọc được bằng onnxruntime 1.17.3; notebook `QUICK=True` chạy cục bộ trên CSV giả; dashboard replay mở được với output smoke, kéo ngưỡng thì tab Đánh giá đổi.
+
+---
+
+## Lịch gốc (đã bị thay bởi mục Sửa đổi 13/10) (hôm nay thứ 2, 12/10/2026 — deadline sáng thứ 6, 16/10)
 
 | Milestone | Hạn | Tasks |
 |---|---|---|
