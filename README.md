@@ -30,3 +30,5 @@ docker compose -f docker/docker-compose.test.yml build cluster
 docker compose -f docker/docker-compose.test.yml run --rm --no-deps cluster pytest -q  # phần cụm (Py3.8 + Java 8)
 docker compose -f docker/docker-compose.test.yml run --rm cluster pytest -q            # kèm Kafka 3.7.2 (test kafka/e2e)
 ```
+Máy dev Windows có Smart App Control: numpy 2.5 bị chặn DLL `numpy.random._mt19937` → trong venv dùng
+`pip install "numpy==2.2.6"` (chỉ cho máy dev, Kaggle không cần).
